@@ -34,7 +34,7 @@ try:
 except ImportError:
     _SELECT_ERROR = OSError
 
-from pymongo import helpers, message
+from pymongo import compression_support, helpers, message
 from pymongo.common import MAX_MESSAGE_SIZE
 from pymongo.errors import (AutoReconnect,
                             NotMasterError,
@@ -139,15 +139,13 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
             duration, response_doc, name, request_id, address)
     return response_doc
 
+_UNPACK_COMPRESSION_HEADER = struct.Struct("<iiB").unpack
 
 def receive_message(sock, request_id, max_message_size=MAX_MESSAGE_SIZE):
     """Receive a raw BSON message or raise socket.error."""
     # Ignore the response's request id.
     length, _, response_to, op_code = _UNPACK_HEADER(
         _receive_data_on_socket(sock, 16))
-    if op_code != _OpReply.OP_CODE:
-        raise ProtocolError("Got opcode %r but expected "
-                            "%r" % (op_code, _OpReply.OP_CODE))
     # No request_id for exhaust cursor "getMore".
     if request_id is not None:
         if request_id != response_to:
@@ -159,8 +157,18 @@ def receive_message(sock, request_id, max_message_size=MAX_MESSAGE_SIZE):
     if length > max_message_size:
         raise ProtocolError("Message length (%r) is larger than server max "
                             "message size (%r)" % (length, max_message_size))
+    if op_code == 2012:
+        op_code, _, compressor_id = _UNPACK_COMPRESSION_HEADER(
+            _receive_data_on_socket(sock, 9))
+        data = compression_support.decompress(
+            compressor_id, _receive_data_on_socket(sock, length - 25))
+    else:
+        data = _receive_data_on_socket(sock, length - 16)
+    if op_code != _OpReply.OP_CODE:
+        raise ProtocolError("Got opcode %r but expected "
+                            "%r" % (op_code, _OpReply.OP_CODE))
 
-    return _OpReply.unpack(_receive_data_on_socket(sock, length - 16))
+    return _OpReply.unpack(data)
 
 
 def _receive_data_on_socket(sock, length):

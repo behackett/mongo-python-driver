@@ -422,6 +422,25 @@ class _CursorAddress(tuple):
         return not self == other
 
 
+_pack_compression_header = struct.Struct("<iiiiiiB").pack
+
+
+def _compress(operation, data, ctx):
+    """Takes message data, compresses it, and adds an OP_COMPRESSED header."""
+    compressed = ctx.compress(data)
+    request_id = _randint()
+
+    header = _pack_compression_header(
+        25 + len(compressed), # Total message length
+        request_id, # Request id
+        0, # responseTo
+        2012, # operation id
+        operation, # original operation id
+        len(data), # uncompressed message length
+        ctx.compressor_id) # compressor id
+    return request_id, header + compressed
+
+
 def __last_error(namespace, args):
     """Data to send to do a lastError.
     """
@@ -432,119 +451,207 @@ def __last_error(namespace, args):
                  None, DEFAULT_CODEC_OPTIONS)
 
 
+_pack_header = struct.Struct("<iiii").pack
+
+
 def __pack_message(operation, data):
     """Takes message data and adds a message header based on the operation.
 
     Returns the resultant message string.
     """
-    request_id = _randint()
-    message = struct.pack("<i", 16 + len(data))
-    message += struct.pack("<i", request_id)
-    message += _ZERO_32  # responseTo
-    message += struct.pack("<i", operation)
-    return (request_id, message + data)
+    rid = _randint()
+    message = _pack_header(16 + len(data), rid, 0, operation)
+    return rid, message + data
+
+
+_pack_int = struct.Struct("<i").pack
+
+
+def _insert(collection_name, docs, check_keys, flags, opts):
+    """Get an OP_INSERT message"""
+    encode = bson._dict_to_bson  # Make local.
+    encoded = [encode(doc, check_keys, opts) for doc in docs]
+    if not encoded:
+        raise InvalidOperation("cannot do an empty bulk insert")
+    return b"".join([
+        _pack_int(flags),
+        bson._make_c_string(collection_name),
+        b"".join(encoded)]), max(map(len, encoded))
+
+
+def insert_compressed(
+        collection_name, docs, check_keys, continue_on_error, opts, ctx):
+    """Get a compressed unacknowledged insert message."""
+    op_insert, max_bson_size = _insert(
+        collection_name, docs, check_keys, continue_on_error, opts)
+    rid, msg = _compress(2002, op_insert, ctx)
+    return rid, msg, max_bson_size
 
 
 def insert(collection_name, docs, check_keys,
            safe, last_error_args, continue_on_error, opts):
     """Get an **insert** message."""
-    options = 0
-    if continue_on_error:
-        options += 1
-    data = struct.pack("<i", options)
-    data += bson._make_c_string(collection_name)
-    encoded = [bson.BSON.encode(doc, check_keys, opts) for doc in docs]
-    if not encoded:
-        raise InvalidOperation("cannot do an empty bulk insert")
-    max_bson_size = max(map(len, encoded))
-    data += _EMPTY.join(encoded)
+    op_insert, max_bson_size = _insert(
+        collection_name, docs, check_keys, continue_on_error, opts)
+    rid, msg = __pack_message(2002, op_insert)
     if safe:
-        (_, insert_message) = __pack_message(2002, data)
-        (request_id, error_message, _) = __last_error(collection_name,
-                                                      last_error_args)
-        return (request_id, insert_message + error_message, max_bson_size)
-    else:
-        (request_id, insert_message) = __pack_message(2002, data)
-        return (request_id, insert_message, max_bson_size)
+        rid, gle, _ = __last_error(collection_name, last_error_args)
+        return rid, msg + gle, max_bson_size
+    return rid, msg, max_bson_size
 if _use_c:
     insert = _cmessage._insert_message
+
+
+def _update(collection_name, upsert, multi, spec, doc, check_keys, opts):
+    """Get an OP_UPDATE message."""
+    flags = 0
+    if upsert:
+        flags += 1
+    if multi:
+        flags += 2
+    encode = bson._dict_to_bson  # Make local.
+    encoded_update = encode(doc, check_keys, opts)
+    return b"".join([
+        _ZERO_32,
+        bson._make_c_string(collection_name),
+        _pack_int(flags),
+        encode(spec, False, opts),
+        encoded_update]), len(encoded_update)
+
+
+def update_compressed(
+        collection_name, upsert, multi, spec, doc, check_keys, opts, ctx):
+    """Get a compressed unacknowledged update message."""
+    op_update, max_bson_size = _update(
+        collection_name, upsert, multi, spec, doc, check_keys, opts)
+    rid, msg = _compress(2001, op_update, ctx)
+    return rid, msg, max_bson_size
 
 
 def update(collection_name, upsert, multi,
            spec, doc, safe, last_error_args, check_keys, opts):
     """Get an **update** message.
     """
-    options = 0
-    if upsert:
-        options += 1
-    if multi:
-        options += 2
-
-    data = _ZERO_32
-    data += bson._make_c_string(collection_name)
-    data += struct.pack("<i", options)
-    data += bson.BSON.encode(spec, False, opts)
-    encoded = bson.BSON.encode(doc, check_keys, opts)
-    data += encoded
+    op_update, max_bson_size = _update(
+        collection_name, upsert, multi, spec, doc, check_keys, opts)
+    rid, msg = __pack_message(2001, op_update)
     if safe:
-        (_, update_message) = __pack_message(2001, data)
-        (request_id, error_message, _) = __last_error(collection_name,
-                                                      last_error_args)
-        return (request_id, update_message + error_message, len(encoded))
-    else:
-        (request_id, update_message) = __pack_message(2001, data)
-        return (request_id, update_message, len(encoded))
+        rid, gle, _ = __last_error(collection_name, last_error_args)
+        return rid, msg + gle, max_bson_size
+    return rid, msg, max_bson_size
 if _use_c:
     update = _cmessage._update_message
 
 
+def _query(options, collection_name, num_to_skip,
+           num_to_return, query, field_selector, opts, check_keys):
+    """Get an OP_QUERY message."""
+    encode = bson._dict_to_bson  # Make local.
+    if check_keys and "$clusterTime" in query:
+        # Temporarily remove $clusterTime to avoid an error from the $-prefix.
+        cluster_time = query.pop('$clusterTime')
+        encoded = encode(query, True, opts)
+        extra = bson._name_value_to_bson(
+            b"$clusterTime\x00", cluster_time, False, opts)
+        encoded = (
+            _pack_int(len(encoded) + len(extra))
+            + encoded[4:-1] + extra + b'\x00')
+        query['$clusterTime'] = cluster_time
+    else:
+        encoded = encode(query, check_keys, opts)
+    if field_selector:
+        efs = encode(field_selector, False, opts)
+    else:
+        efs = b""
+    max_bson_size = max(len(encoded), len(efs))
+    return b"".join([
+        _pack_int(options),
+        bson._make_c_string(collection_name),
+        _pack_int(num_to_skip),
+        _pack_int(num_to_return),
+        encoded,
+        efs]), max_bson_size
+
+
+def query_compressed(options, collection_name, num_to_skip,
+                     num_to_return, query, field_selector,
+                     opts, check_keys=False, ctx=None):
+    """Get a compressed query message."""
+    op_query, max_bson_size = _query(
+        options,
+        collection_name,
+        num_to_skip,
+        num_to_return,
+        query,
+        field_selector,
+        opts,
+        check_keys)
+    rid, msg = _compress(2004, op_query, ctx)
+    return rid, msg, max_bson_size
+
+
 def query(options, collection_name, num_to_skip,
           num_to_return, query, field_selector, opts, check_keys=False):
-    """Get a **query** message.
-    """
-    data = struct.pack("<I", options)
-    data += bson._make_c_string(collection_name)
-    data += struct.pack("<i", num_to_skip)
-    data += struct.pack("<i", num_to_return)
-    if check_keys:
-        # Temporarily remove $clusterTime to avoid an error from the $-prefix.
-        cluster_time = query.pop('$clusterTime', None)
-        encoded = bson.BSON.encode(query, True, opts)
-        if cluster_time is not None:
-            extra = bson._name_value_to_bson(
-                b"$clusterTime\x00", cluster_time, False, opts)
-            encoded = (
-                bson._PACK_INT(len(encoded) + len(extra))
-                + encoded[4:-1] + extra + b'\x00')
-            query['$clusterTime'] = cluster_time
-    else:
-        encoded = bson.BSON.encode(query, False, opts)
-    data += encoded
-    max_bson_size = len(encoded)
-    if field_selector is not None:
-        encoded = bson.BSON.encode(field_selector, False, opts)
-        data += encoded
-        max_bson_size = max(len(encoded), max_bson_size)
-    (request_id, query_message) = __pack_message(2004, data)
-    return (request_id, query_message, max_bson_size)
+    """Get a **query** message."""
+    op_query, max_bson_size = _query(
+        options,
+        collection_name,
+        num_to_skip,
+        num_to_return,
+        query,
+        field_selector,
+        opts,
+        check_keys)
+    rid, msg = __pack_message(2004, op_query)
+    return rid, msg, max_bson_size
 if _use_c:
     query = _cmessage._query_message
 
 
+_pack_long_long = struct.Struct("<q").pack
+
+
+def _get_more(collection_name, num_to_return, cursor_id):
+    """Get an OP_GET_MORE message."""
+    return b"".join([
+        _ZERO_32,
+        bson._make_c_string(collection_name),
+        _pack_int(num_to_return),
+        _pack_long_long(cursor_id)])
+
+
+def get_more_compressed(collection_name, num_to_return, cursor_id, ctx):
+    """Get a compressed getMore message."""
+    return _compress(
+        2005, _get_more(collection_name, num_to_return, cursor_id), ctx)
+
+
 def get_more(collection_name, num_to_return, cursor_id):
-    """Get a **getMore** message.
-    """
-    data = _ZERO_32
-    data += bson._make_c_string(collection_name)
-    data += struct.pack("<i", num_to_return)
-    data += struct.pack("<q", cursor_id)
-    return __pack_message(2005, data)
+    """Get a **getMore** message."""
+    return __pack_message(
+        2005, _get_more(collection_name, num_to_return, cursor_id))
 if _use_c:
     get_more = _cmessage._get_more_message
 
 
-def delete(collection_name, spec, safe,
-           last_error_args, opts, flags=0):
+def _delete(collection_name, spec, opts, flags):
+    """Get an OP_DELETE message."""
+    encoded = bson._dict_to_bson(spec, False, opts)
+    return b"".join([
+        _ZERO_32,
+        bson._make_c_string(collection_name),
+        _pack_int(flags),
+        encoded]), len(encoded)
+
+
+def delete_compressed(collection_name, spec, opts, flags, ctx):
+    """Get a compressed unacknowledged delete message."""
+    op_delete, max_bson_size = _delete(collection_name, spec, opts, flags)
+    rid, msg = _compress(2006, op_delete, ctx)
+    return rid, msg, max_bson_size
+
+
+def delete(collection_name, spec, safe, last_error_args, opts, flags=0):
     """Get a **delete** message.
 
     `opts` is a CodecOptions. `flags` is a bit vector that may contain
@@ -552,29 +659,21 @@ def delete(collection_name, spec, safe,
 
     http://docs.mongodb.org/meta-driver/latest/legacy/mongodb-wire-protocol/#op-delete
     """
-    data = _ZERO_32
-    data += bson._make_c_string(collection_name)
-    data += struct.pack("<I", flags)
-    encoded = bson.BSON.encode(spec, False, opts)
-    data += encoded
+    op_delete, max_bson_size = _delete(collection_name, spec, opts, flags)
+    rid, msg = __pack_message(2006, op_delete)
     if safe:
-        (_, remove_message) = __pack_message(2006, data)
-        (request_id, error_message, _) = __last_error(collection_name,
-                                                      last_error_args)
-        return (request_id, remove_message + error_message, len(encoded))
-    else:
-        (request_id, remove_message) = __pack_message(2006, data)
-        return (request_id, remove_message, len(encoded))
+        rid, gle, _ = __last_error(collection_name, last_error_args)
+        return rid, msg + gle, max_bson_size
+    return rid, msg, max_bson_size
 
 
 def kill_cursors(cursor_ids):
     """Get a **killCursors** message.
     """
-    data = _ZERO_32
-    data += struct.pack("<i", len(cursor_ids))
-    for cursor_id in cursor_ids:
-        data += struct.pack("<q", cursor_id)
-    return __pack_message(2007, data)
+    num_cursors = len(cursor_ids)
+    pack = struct.Struct("<ii" + ("q" * num_cursors)).pack
+    op_kill_cursors = pack(0, num_cursors, *cursor_ids)
+    return __pack_message(2007, op_kill_cursors)
 
 
 _FIELD_MAP = {

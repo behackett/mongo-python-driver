@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 try:
     import snappy
     _HAVE_SNAPPY = True
@@ -27,16 +29,31 @@ except ImportError:
     _HAVE_ZLIB = False
 
 
-def validate_compressor(dummy, value):
+_SUPPORTED_COMPRESSORS = set(["snappy", "zlib"])
+_SENSITIVE_COMMANDS = set([
+    "ismaster",
+    "saslstart",
+    "saslcontinue",
+    "getnonce",
+    "authenticate",
+    "createuser",
+    "updateuser",
+    "copydbsaslstart",
+    "copydbgetnonce",
+    "copydb"])
+
+
+def validate_compressors(dummy, value):
     compressors = value.split(",")
-    for compressor in compressors:
-        if compressor == "snappy" and not _HAVE_SNAPPY:
+    for compressor in compressors.copy():
+        if compressor not in _SUPPORTED_COMPRESSORS:
+            compressors.remove(compressor)
+            warnings.warn("Unknown compressor %s", (compressor,))
+        elif compressor == "snappy" and not _HAVE_SNAPPY:
             raise ValueError(
                 "You must install the python-snappy module for snappy support.")
         elif compressor == "zlib" and not _HAVE_ZLIB:
             raise ValueError("The zlib module is not available.")
-        else:
-            raise ValueError("Unknown compressor %s", (compressor,))
     return compressors
 
 
@@ -57,6 +74,20 @@ def decompress(data, compressor_id):
         return zlib.decompress(data)
     else:
         raise ValueError("Unknown compressorId %d" % (compressor_id,))
+
+
+class CompressionSettings(object):
+    def __init__(self, compressors, zlib_compression_level):
+        self.compressors = compressors
+        self.zlib_compression_level = zlib_compression_level
+
+    def get_compression_context(self, compressors):
+        if compressors:
+            chosen = compressors[0]
+            if chosen == "snappy":
+                return SnappyContext()
+            elif chosen == "zlib":
+                return ZlibContext(self.zlib_compression_level)
 
 
 class SnappyContext(object):

@@ -25,7 +25,7 @@ import random
 import struct
 
 import bson
-from bson import CodecOptions
+from bson import CodecOptions, _make_c_string, _dict_to_bson
 from bson.codec_options import DEFAULT_CODEC_OPTIONS
 from bson.py3compat import b, StringIO
 from bson.son import SON
@@ -469,13 +469,13 @@ _pack_int = struct.Struct("<i").pack
 
 def _insert(collection_name, docs, check_keys, flags, opts):
     """Get an OP_INSERT message"""
-    encode = bson._dict_to_bson  # Make local.
+    encode = _dict_to_bson  # Make local.
     encoded = [encode(doc, check_keys, opts) for doc in docs]
     if not encoded:
         raise InvalidOperation("cannot do an empty bulk insert")
     return b"".join([
         _pack_int(flags),
-        bson._make_c_string(collection_name),
+        _make_c_string(collection_name),
         b"".join(encoded)]), max(map(len, encoded))
 
 
@@ -509,11 +509,11 @@ def _update(collection_name, upsert, multi, spec, doc, check_keys, opts):
         flags += 1
     if multi:
         flags += 2
-    encode = bson._dict_to_bson  # Make local.
+    encode = _dict_to_bson  # Make local.
     encoded_update = encode(doc, check_keys, opts)
     return b"".join([
         _ZERO_32,
-        bson._make_c_string(collection_name),
+        _make_c_string(collection_name),
         _pack_int(flags),
         encode(spec, False, opts),
         encoded_update]), len(encoded_update)
@@ -546,7 +546,7 @@ if _use_c:
 def _query(options, collection_name, num_to_skip,
            num_to_return, query, field_selector, opts, check_keys):
     """Get an OP_QUERY message."""
-    encode = bson._dict_to_bson  # Make local.
+    encode = _dict_to_bson  # Make local.
     if check_keys and "$clusterTime" in query:
         # Temporarily remove $clusterTime to avoid an error from the $-prefix.
         cluster_time = query.pop('$clusterTime')
@@ -566,7 +566,7 @@ def _query(options, collection_name, num_to_skip,
     max_bson_size = max(len(encoded), len(efs))
     return b"".join([
         _pack_int(options),
-        bson._make_c_string(collection_name),
+        _make_c_string(collection_name),
         _pack_int(num_to_skip),
         _pack_int(num_to_return),
         encoded,
@@ -615,7 +615,7 @@ def _get_more(collection_name, num_to_return, cursor_id):
     """Get an OP_GET_MORE message."""
     return b"".join([
         _ZERO_32,
-        bson._make_c_string(collection_name),
+        _make_c_string(collection_name),
         _pack_int(num_to_return),
         _pack_long_long(cursor_id)])
 
@@ -636,10 +636,10 @@ if _use_c:
 
 def _delete(collection_name, spec, opts, flags):
     """Get an OP_DELETE message."""
-    encoded = bson._dict_to_bson(spec, False, opts)
+    encoded = _dict_to_bson(spec, False, opts)
     return b"".join([
         _ZERO_32,
-        bson._make_c_string(collection_name),
+        _make_c_string(collection_name),
         _pack_int(flags),
         encoded]), len(encoded)
 
@@ -827,7 +827,7 @@ def _do_batched_insert(collection_name, docs, check_keys,
     last_error = None
     data = StringIO()
     data.write(struct.pack("<i", int(continue_on_error)))
-    data.write(bson._make_c_string(collection_name))
+    data.write(_make_c_string(collection_name))
     message_length = begin_loc = data.tell()
     has_docs = False
     to_send = []

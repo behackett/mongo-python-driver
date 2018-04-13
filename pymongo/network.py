@@ -34,8 +34,9 @@ try:
 except ImportError:
     _SELECT_ERROR = OSError
 
-from pymongo import compression_support, helpers, message
+from pymongo import helpers, message
 from pymongo.common import MAX_MESSAGE_SIZE
+from pymongo.compression_support import decompress, _SENSITIVE_COMMANDS
 from pymongo.errors import (AutoReconnect,
                             NotMasterError,
                             OperationFailure,
@@ -52,7 +53,8 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
             check_keys=False, listeners=None, max_bson_size=None,
             read_concern=None,
             parse_write_concern_error=False,
-            collation=None):
+            collation=None,
+            compression_ctx=None):
     """Execute a command over the socket, or raise socket.error.
 
     :Parameters:
@@ -98,8 +100,12 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
     if publish:
         start = datetime.datetime.now()
 
-    request_id, msg, size = message.query(flags, ns, 0, -1, spec,
-                                          None, codec_options, check_keys)
+    if name not in _SENSITIVE_COMMANDS and compression_ctx:
+        request_id, msg, size = message.query_compressed(
+            flags, ns, 0, -1, spec, None, codec_options, check_keys, compression_ctx)
+    else:
+        request_id, msg, size = message.query(
+            flags, ns, 0, -1, spec, None, codec_options, check_keys)
 
     if (max_bson_size is not None
             and size > max_bson_size + message._COMMAND_OVERHEAD):
@@ -160,8 +166,8 @@ def receive_message(sock, request_id, max_message_size=MAX_MESSAGE_SIZE):
     if op_code == 2012:
         op_code, _, compressor_id = _UNPACK_COMPRESSION_HEADER(
             _receive_data_on_socket(sock, 9))
-        data = compression_support.decompress(
-            compressor_id, _receive_data_on_socket(sock, length - 25))
+        data = decompress(
+            _receive_data_on_socket(sock, length - 25), compressor_id)
     else:
         data = _receive_data_on_socket(sock, length - 16)
     if op_code != _OpReply.OP_CODE:

@@ -319,6 +319,11 @@ class _Query(object):
             spec = _maybe_add_read_preference(spec,
                                               self.read_preference)
 
+        if sock_info.compression_context:
+            return query_compressed(
+                flags, ns, self.ntoskip, ntoreturn,
+                spec, None if use_cmd else self.fields,
+                self.codec_options, ctx=sock_info.compression_context)
         return query(flags, ns, self.ntoskip, ntoreturn,
                      spec, None if use_cmd else self.fields, self.codec_options)
 
@@ -361,13 +366,19 @@ class _GetMore(object):
         """Get a getmore message."""
 
         ns = _UJOIN % (self.db, self.coll)
+        ctx = sock_info.compression_context
 
         if use_cmd:
             ns = _UJOIN % (self.db, "$cmd")
             spec = self.as_command(sock_info)[0]
 
+            if ctx:
+                return query_compressed(
+                    0, ns, 0, -1, spec, None, self.codec_options, ctx=ctx)
             return query(0, ns, 0, -1, spec, None, self.codec_options)
 
+        if ctx:
+            return get_more_compressed(ns, self.ntoreturn, self.cursor_id, ctx)
         return get_more(ns, self.ntoreturn, self.cursor_id)
 
 

@@ -6,6 +6,9 @@ Changes in Version 3.7.0
 
 - wtimeoutMS is once again supported as a URI option.
 
+- Support for wire protocol compression. See
+  :meth:`~pymongo.mongo_client.MongoClient` for details.
+
 Issues Resolved
 ...............
 

@@ -896,21 +896,58 @@ if _use_c:
     _do_batched_insert = _cmessage._do_batched_insert
 
 
-def _do_batched_write_command(namespace, operation, command,
-                              docs, check_keys, opts, ctx):
+def _do_batched_compressed_write_command(
+        namespace, operation, command, docs, check_keys, opts, ctx):
+    """Create the next batched insert, update, or delete command, compressed.
+    """
+    buf = StringIO()
+
+    to_send, _ = _batched_write_command(
+        namespace, operation, command, docs, check_keys, opts, ctx, buf)
+
+    request_id, msg = _compress(
+        2004,
+        buf.getvalue(),
+        ctx.sock_info.compression_context)
+    return request_id, msg, to_send
+
+
+def _do_batched_write_command(
+        namespace, operation, command, docs, check_keys, opts, ctx):
     """Create the next batched insert, update, or delete command.
     """
+    buf = StringIO()
+
+    # Save space for message length and request id
+    buf.write(_ZERO_64)
+    # responseTo, opCode
+    buf.write(b"\x00\x00\x00\x00\xd4\x07\x00\x00")
+
+    # Write OP_QUERY write command
+    to_send, length = _batched_write_command(
+        namespace, operation, command, docs, check_keys, opts, ctx, buf)
+
+    # Header - request id and message length
+    buf.seek(4)
+    request_id = _randint()
+    buf.write(struct.pack('<i', request_id))
+    buf.seek(0)
+    buf.write(struct.pack('<i', length))
+
+    return request_id, buf.getvalue(), to_send
+if _use_c:
+    _do_batched_write_command = _cmessage._do_batched_write_command
+
+
+def _batched_write_command(
+        namespace, operation, command, docs, check_keys, opts, ctx, buf):
+    """Create a batched OP_QUERY write command."""
     max_bson_size = ctx.max_bson_size
     max_write_batch_size = ctx.max_write_batch_size
     # Max BSON object size + 16k - 2 bytes for ending NUL bytes.
     # Server guarantees there is enough room: SERVER-10643.
     max_cmd_size = max_bson_size + _COMMAND_OVERHEAD
 
-    buf = StringIO()
-    # Save space for message length and request id
-    buf.write(_ZERO_64)
-    # responseTo, opCode
-    buf.write(b"\x00\x00\x00\x00\xd4\x07\x00\x00")
     # No options
     buf.write(_ZERO_32)
     # Namespace as C string
@@ -970,15 +1007,8 @@ def _do_batched_write_command(namespace, operation, command,
     buf.write(struct.pack('<i', length - list_start - 1))
     buf.seek(command_start)
     buf.write(struct.pack('<i', length - command_start))
-    buf.seek(4)
-    request_id = _randint()
-    buf.write(struct.pack('<i', request_id))
-    buf.seek(0)
-    buf.write(struct.pack('<i', length))
 
-    return request_id, buf.getvalue(), to_send
-if _use_c:
-    _do_batched_write_command = _cmessage._do_batched_write_command
+    return to_send, length
 
 
 class _OpReply(object):

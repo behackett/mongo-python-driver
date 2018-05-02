@@ -971,43 +971,16 @@ insertfail:
     return NULL;
 }
 
-static buffer_t
-_command_buffer_new(char* ns, int ns_len) {
-    buffer_t buffer;
-    if (!(buffer = buffer_new())) {
-        PyErr_NoMemory();
-        return NULL;
-    }
-    /* Save space for message length and request id */
-    if ((buffer_save_space(buffer, 8)) == -1) {
-        PyErr_NoMemory();
-        buffer_free(buffer);
-        return NULL;
-    }
-    if (!buffer_write_bytes(buffer,
-                            "\x00\x00\x00\x00"  /* responseTo */
-                            "\xd4\x07\x00\x00"  /* opcode */
-                            "\x00\x00\x00\x00", /* flags */
-                            12) ||
-        !buffer_write_bytes(buffer,
-                            ns, ns_len + 1) ||  /* namespace */
-        !buffer_write_bytes(buffer,
-                            "\x00\x00\x00\x00"  /* skip */
-                            "\xFF\xFF\xFF\xFF", /* limit (-1) */
-                            8)) {
-        buffer_free(buffer);
-        return NULL;
-    }
-    return buffer;
-}
-
 #define _INSERT 0
 #define _UPDATE 1
 #define _DELETE 2
 
-static PyObject*
-_cbson_do_batched_write_command(PyObject* self, PyObject* args) {
-    struct module_state *state = GETSTATE(self);
+static int
+_batched_write_command(
+        char* ns, int ns_len, unsigned char op, int check_keys,
+        PyObject* command, PyObject* docs, PyObject* ctx,
+        PyObject* to_publish, codec_options_t options,
+        buffer_t buffer, struct module_state *state) {
 
     long max_bson_size;
     long max_cmd_size;
@@ -1015,31 +988,13 @@ _cbson_do_batched_write_command(PyObject* self, PyObject* args) {
     int idx = 0;
     int cmd_len_loc;
     int lst_len_loc;
-    int ns_len;
     int request_id;
     int position;
     int length;
-    char *ns = NULL;
     PyObject* max_bson_size_obj;
     PyObject* max_write_batch_size_obj;
-    PyObject* command;
     PyObject* doc;
-    PyObject* docs;
-    PyObject* ctx;
     PyObject* iterator;
-    PyObject* result;
-    PyObject* to_publish = NULL;
-    unsigned char op;
-    unsigned char check_keys;
-    codec_options_t options;
-    buffer_t buffer;
-
-    if (!PyArg_ParseTuple(args, "et#bOObO&O", "utf-8",
-                          &ns, &ns_len, &op, &command, &docs, &check_keys,
-                          convert_codec_options, &options,
-                          &ctx)) {
-        return NULL;
-    }
 
     max_bson_size_obj = PyObject_GetAttrString(ctx, "max_bson_size");
 #if PY_MAJOR_VERSION >= 3
@@ -1049,9 +1004,7 @@ _cbson_do_batched_write_command(PyObject* self, PyObject* args) {
 #endif
     Py_XDECREF(max_bson_size_obj);
     if (max_bson_size == -1) {
-        destroy_codec_options(&options);
-        PyMem_Free(ns);
-        return NULL;
+        return 0;
     }
     /*
      * Max BSON object size + 16k - 2 bytes for ending NUL bytes
@@ -1067,31 +1020,26 @@ _cbson_do_batched_write_command(PyObject* self, PyObject* args) {
 #endif
     Py_XDECREF(max_write_batch_size_obj);
     if (max_write_batch_size == -1) {
-        destroy_codec_options(&options);
-        PyMem_Free(ns);
-        return NULL;
+        return 0;
     }
 
-    if (!(to_publish = PyList_New(0))) {
-        destroy_codec_options(&options);
-        PyMem_Free(ns);
-        return NULL;
+    if (!buffer_write_bytes(buffer,
+                            "\x00\x00\x00\x00", /* flags */
+                            4) ||
+        !buffer_write_bytes(buffer,
+                            ns, ns_len + 1) ||  /* namespace */
+        !buffer_write_bytes(buffer,
+                            "\x00\x00\x00\x00"  /* skip */
+                            "\xFF\xFF\xFF\xFF", /* limit (-1) */
+                             8)) {
+        return 0;
     }
-
-    if (!(buffer = _command_buffer_new(ns, ns_len))) {
-        destroy_codec_options(&options);
-        PyMem_Free(ns);
-        Py_DECREF(to_publish);
-        return NULL;
-    }
-
-    PyMem_Free(ns);
 
     /* Position of command document length */
     cmd_len_loc = buffer_get_position(buffer);
     if (!write_dict(state->_cbson, buffer, command, 0,
                     &options, 0)) {
-        goto cmdfail;
+        return 0;
     }
 
     /* Write type byte for array */
@@ -1127,7 +1075,7 @@ _cbson_do_batched_write_command(PyObject* self, PyObject* args) {
                 PyErr_SetString(InvalidOperation, "Unknown command");
                 Py_DECREF(InvalidOperation);
             }
-            goto cmdfail;
+            return 0;
         }
     }
 
@@ -1135,7 +1083,7 @@ _cbson_do_batched_write_command(PyObject* self, PyObject* args) {
     lst_len_loc = buffer_save_space(buffer, 4);
     if (lst_len_loc == -1) {
         PyErr_NoMemory();
-        goto cmdfail;
+        return 0;
     }
 
     iterator = PyObject_GetIter(docs);
@@ -1145,7 +1093,7 @@ _cbson_do_batched_write_command(PyObject* self, PyObject* args) {
             PyErr_SetString(InvalidOperation, "input is not iterable");
             Py_DECREF(InvalidOperation);
         }
-        goto cmdfail;
+        return 0;
     }
     while ((doc = PyIter_Next(iterator)) != NULL) {
         int sub_doc_begin = buffer_get_position(buffer);
@@ -1214,32 +1162,151 @@ _cbson_do_batched_write_command(PyObject* self, PyObject* args) {
         goto cmdfail;
 
 
-    request_id = rand();
     position = buffer_get_position(buffer);
     length = position - lst_len_loc - 1;
     buffer_write_int32_at_position(buffer, lst_len_loc, (int32_t)length);
     length = position - cmd_len_loc;
     buffer_write_int32_at_position(buffer, cmd_len_loc, (int32_t)length);
+    return 1;
+
+cmditerfail:
+    Py_XDECREF(doc);
+    Py_DECREF(iterator);
+cmdfail:
+    return 0;
+}
+
+static PyObject*
+_cbson_encode_batched_write_command(PyObject* self, PyObject* args) {
+    char *ns = NULL;
+    unsigned char op;
+    unsigned char check_keys;
+    int ns_len;
+    PyObject* command;
+    PyObject* docs;
+    PyObject* ctx;
+    PyObject* to_publish = NULL;
+    PyObject* result = NULL;
+    codec_options_t options;
+    struct module_state *state = GETSTATE(self);
+
+    if (!PyArg_ParseTuple(args, "et#bOObO&O", "utf-8",
+                          &ns, &ns_len, &op, &command, &docs, &check_keys,
+                          convert_codec_options, &options,
+                          &ctx)) {
+        return NULL;
+    }
+    buffer_t buffer;
+    if (!(buffer = buffer_new())) {
+        PyErr_NoMemory();
+        PyMem_Free(ns);
+        destroy_codec_options(&options);
+        return NULL;
+    }
+    if (!(to_publish = PyList_New(0))) {
+        goto fail;
+    }
+
+    if (!_batched_write_command(
+            ns,
+            ns_len,
+            op,
+            check_keys,
+            command,
+            docs,
+            ctx,
+            to_publish,
+            options,
+            buffer,
+            state)) {
+        goto fail;
+    }
+
+    result = Py_BuildValue(BYTES_FORMAT_STRING "O",
+                           buffer_get_buffer(buffer),
+                           buffer_get_position(buffer),
+                           to_publish);
+fail:
+    PyMem_Free(ns);
+    destroy_codec_options(&options);
+    buffer_free(buffer);
+    Py_XDECREF(to_publish);
+    return result;
+}
+
+static PyObject*
+_cbson_do_batched_write_command(PyObject* self, PyObject* args) {
+    char *ns = NULL;
+    unsigned char op;
+    unsigned char check_keys;
+    int ns_len;
+    int request_id;
+    int position;
+    PyObject* command;
+    PyObject* docs;
+    PyObject* ctx;
+    PyObject* to_publish = NULL;
+    PyObject* result = NULL;
+    codec_options_t options;
+    struct module_state *state = GETSTATE(self);
+
+    if (!PyArg_ParseTuple(args, "et#bOObO&O", "utf-8",
+                          &ns, &ns_len, &op, &command, &docs, &check_keys,
+                          convert_codec_options, &options,
+                          &ctx)) {
+        return NULL;
+    }
+    buffer_t buffer;
+    if (!(buffer = buffer_new())) {
+        PyErr_NoMemory();
+        PyMem_Free(ns);
+        destroy_codec_options(&options);
+        return NULL;
+    }
+    /* Save space for message length and request id */
+    if ((buffer_save_space(buffer, 8)) == -1) {
+        PyErr_NoMemory();
+        goto fail;
+    }
+    if (!buffer_write_bytes(buffer,
+                            "\x00\x00\x00\x00"  /* responseTo */
+                            "\xd4\x07\x00\x00", /* opcode */
+                            8)) {
+        goto fail;
+    }
+    if (!(to_publish = PyList_New(0))) {
+        goto fail;
+    }
+
+    if (!_batched_write_command(
+            ns,
+            ns_len,
+            op,
+            check_keys,
+            command,
+            docs,
+            ctx,
+            to_publish,
+            options,
+            buffer,
+            state)) {
+        goto fail;
+    }
+
+    request_id = rand();
+    position = buffer_get_position(buffer);
     buffer_write_int32_at_position(buffer, 0, (int32_t)position);
     buffer_write_int32_at_position(buffer, 4, (int32_t)request_id);
     result = Py_BuildValue("i" BYTES_FORMAT_STRING "O", request_id,
                            buffer_get_buffer(buffer),
                            buffer_get_position(buffer),
                            to_publish);
-
-    Py_DECREF(to_publish);
+fail:
+    PyMem_Free(ns);
+    destroy_codec_options(&options);
     buffer_free(buffer);
-    destroy_codec_options(&options);
-    return result;
-
-cmditerfail:
-    Py_XDECREF(doc);
-    Py_DECREF(iterator);
-cmdfail:
-    destroy_codec_options(&options);
     Py_XDECREF(to_publish);
-    buffer_free(buffer);
-    return NULL;
+    return result;
 }
 
 static PyMethodDef _CMessageMethods[] = {
@@ -1255,6 +1322,8 @@ static PyMethodDef _CMessageMethods[] = {
      "insert a batch of documents, splitting the batch as needed"},
     {"_do_batched_write_command", _cbson_do_batched_write_command, METH_VARARGS,
      "Create the next batched insert, update, or delete command"},
+    {"_encode_batched_write_command", _cbson_encode_batched_write_command, METH_VARARGS,
+     "Encode the next batched insert, update, or delete command"},
     {NULL, NULL, 0, NULL}
 };
 

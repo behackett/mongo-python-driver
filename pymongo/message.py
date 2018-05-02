@@ -480,7 +480,14 @@ _pack_int = struct.Struct("<i").pack
 
 def _insert(collection_name, docs, check_keys, flags, opts):
     """Get an OP_INSERT message"""
-    encode = _dict_to_bson  # Make local.
+    encode = _dict_to_bson  # Make local. Uses extensions.
+    if len(docs) == 1:
+        encoded = encode(docs[0], check_keys, opts)
+        return b"".join([
+            b"\x00\x00\x00\x00",  # Flags don't matter for one doc.
+            _make_c_string(collection_name),
+            encoded]), len(encoded)
+
     encoded = [encode(doc, check_keys, opts) for doc in docs]
     if not encoded:
         raise InvalidOperation("cannot do an empty bulk insert")
@@ -520,7 +527,7 @@ def _update(collection_name, upsert, multi, spec, doc, check_keys, opts):
         flags += 1
     if multi:
         flags += 2
-    encode = _dict_to_bson  # Make local.
+    encode = _dict_to_bson  # Make local. Uses extensions.
     encoded_update = encode(doc, check_keys, opts)
     return b"".join([
         _ZERO_32,
@@ -557,7 +564,7 @@ if _use_c:
 def _query(options, collection_name, num_to_skip,
            num_to_return, query, field_selector, opts, check_keys):
     """Get an OP_QUERY message."""
-    encode = _dict_to_bson  # Make local.
+    encode = _dict_to_bson  # Make local. Uses extensions.
     if check_keys and "$clusterTime" in query:
         # Temporarily remove $clusterTime to avoid an error from the $-prefix.
         cluster_time = query.pop('$clusterTime')
@@ -647,7 +654,7 @@ if _use_c:
 
 def _delete(collection_name, spec, opts, flags):
     """Get an OP_DELETE message."""
-    encoded = _dict_to_bson(spec, False, opts)
+    encoded = _dict_to_bson(spec, False, opts)  # Uses extensions.
     return b"".join([
         _ZERO_32,
         _make_c_string(collection_name),
@@ -900,16 +907,27 @@ def _do_batched_compressed_write_command(
         namespace, operation, command, docs, check_keys, opts, ctx):
     """Create the next batched insert, update, or delete command, compressed.
     """
+    data, to_send = _encode_batched_write_command(
+        namespace, operation, command, docs, check_keys, opts, ctx)
+
+    request_id, msg = _compress(
+        2004,
+        data,
+        ctx.sock_info.compression_context)
+    return request_id, msg, to_send
+
+
+def _encode_batched_write_command(
+        namespace, operation, command, docs, check_keys, opts, ctx):
+    """Encode the next batched insert, update, or delete command.
+    """
     buf = StringIO()
 
     to_send, _ = _batched_write_command(
         namespace, operation, command, docs, check_keys, opts, ctx, buf)
-
-    request_id, msg = _compress(
-        2004,
-        buf.getvalue(),
-        ctx.sock_info.compression_context)
-    return request_id, msg, to_send
+    return buf.getvalue(), to_send
+if _use_c:
+    _encode_batched_write_command = _cmessage._encode_batched_write_command
 
 
 def _do_batched_write_command(

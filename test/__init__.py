@@ -72,6 +72,7 @@ if CA_PEM:
 if CERT_REQS is not None:
     _SSL_OPTIONS['ssl_cert_reqs'] = CERT_REQS
 
+COMPRESSORS = os.environ.get("COMPRESSORS")
 
 def is_server_resolvable():
     """Returns True if 'server' is resolvable."""
@@ -285,6 +286,8 @@ class ClientContext(object):
             timeout_ms = 10000
         else:
             timeout_ms = 500
+        if COMPRESSORS:
+            kwargs["compressors"] = COMPRESSORS
         client = pymongo.MongoClient(
             host, port, serverSelectionTimeoutMS=timeout_ms, **kwargs)
         try:

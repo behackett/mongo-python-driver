@@ -45,7 +45,7 @@ _SENSITIVE_COMMANDS = set([
 
 def validate_compressors(dummy, value):
     compressors = value.split(",")
-    for compressor in compressors.copy():
+    for compressor in compressors[:]:
         if compressor not in _SUPPORTED_COMPRESSORS:
             compressors.remove(compressor)
             warnings.warn("Unknown compressor %s", (compressor,))

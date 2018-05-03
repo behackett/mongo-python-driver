@@ -706,7 +706,7 @@ class _BulkWriteContext(object):
 
     __slots__ = ('db_name', 'command', 'sock_info', 'op_id',
                  'name', 'field', 'publish', 'start_time', 'listeners',
-                 'session')
+                 'session', 'compress')
 
     def __init__(self, database_name, command, sock_info, operation_id,
                  listeners, session):
@@ -720,6 +720,7 @@ class _BulkWriteContext(object):
         self.field = _FIELD_MAP[self.name]
         self.start_time = datetime.datetime.now() if self.publish else None
         self.session = session
+        self.compress = 1 if sock_info.compression_context else 0
 
     @property
     def max_bson_size(self):
@@ -735,6 +736,14 @@ class _BulkWriteContext(object):
     def max_write_batch_size(self):
         """A proxy for SockInfo.max_write_batch_size."""
         return self.sock_info.max_write_batch_size
+
+    def legacy_bulk_insert(
+            self, request_id, msg, max_doc_size, acknowledged, docs):
+        if self.compress:
+            request_id, msg = _compress(
+                2002, msg, self.sock_info.compression_context)
+        return self.legacy_write(
+            request_id, msg, max_doc_size, acknowledged, docs)
 
     def legacy_write(self, request_id, msg, max_doc_size, acknowledged, docs):
         """A proxy for SocketInfo.legacy_write that handles event publishing.
@@ -864,8 +873,11 @@ def _do_batched_insert(collection_name, docs, check_keys,
         if has_docs:
             # We have enough data, send this message.
             try:
-                request_id, msg = _insert_message(data.getvalue(), send_safe)
-                ctx.legacy_write(request_id, msg, 0, send_safe, to_send)
+                if ctx.compress and not safe:
+                    rid, msg = None, data.getvalue()
+                else:
+                    rid, msg = _insert_message(data.getvalue(), send_safe)
+                ctx.legacy_bulk_insert(rid, msg, 0, send_safe, to_send)
             # Exception type could be OperationFailure or a subtype
             # (e.g. DuplicateKeyError)
             except OperationFailure as exc:
@@ -893,8 +905,11 @@ def _do_batched_insert(collection_name, docs, check_keys,
     if not has_docs:
         raise InvalidOperation("cannot do an empty bulk insert")
 
-    request_id, msg = _insert_message(data.getvalue(), safe)
-    ctx.legacy_write(request_id, msg, 0, safe, to_send)
+    if ctx.compress and not safe:
+        request_id, msg = None, data.getvalue()
+    else:
+        request_id, msg = _insert_message(data.getvalue(), safe)
+    ctx.legacy_bulk_insert(request_id, msg, 0, safe, to_send)
 
     # Re-raise any exception stored due to continue_on_error
     if last_error is not None:

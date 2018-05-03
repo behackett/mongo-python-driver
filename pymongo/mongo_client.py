@@ -259,7 +259,8 @@ class MongoClient(common.BaseObject):
             `python-snappy <https://pypi.org/project/python-snappy/>`_ package.
             zlib support requires the Python standard library zlib module.
             By default no compression is used. Compression support must also be
-            enabled on the server.
+            enabled on the server. MongoDB 3.4+ supports snappy compression.
+            MongoDB 3.6+ supports snappy and zlib.
           - `zlibCompressionLevel`: (int) The zlib compression level to use
             when zlib is used as the wire protocol compressor. Supported values
             are -1 through 9. -1 tells the zlib library to use its default

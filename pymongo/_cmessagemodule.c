@@ -142,19 +142,25 @@ static int add_last_error(PyObject* self, buffer_t buffer,
 }
 
 static int init_insert_buffer(buffer_t buffer, int request_id, int options,
-                              const char* coll_name, int coll_name_len) {
-    /* Save space for message length */
-    int length_location = buffer_save_space(buffer, 4);
-    if (length_location == -1) {
-        PyErr_NoMemory();
-        return length_location;
+                              const char* coll_name, int coll_name_len,
+                              int compress) {
+    int length_location = 0;
+    if (!compress) {
+        /* Save space for message length */
+        int length_location = buffer_save_space(buffer, 4);
+        if (length_location == -1) {
+            PyErr_NoMemory();
+            return length_location;
+        }
+        if (!buffer_write_int32(buffer, (int32_t)request_id) ||
+            !buffer_write_bytes(buffer,
+                                "\x00\x00\x00\x00"
+                                "\xd2\x07\x00\x00",
+                                8)) {
+            return -1;
+        }
     }
-    if (!buffer_write_int32(buffer, (int32_t)request_id) ||
-        !buffer_write_bytes(buffer,
-                            "\x00\x00\x00\x00"
-                            "\xd2\x07\x00\x00",
-                            8) ||
-        !buffer_write_int32(buffer, (int32_t)options) ||
+    if (!buffer_write_int32(buffer, (int32_t)options) ||
         !buffer_write_bytes(buffer,
                             coll_name,
                             coll_name_len + 1)) {
@@ -211,7 +217,8 @@ static PyObject* _cbson_insert_message(PyObject* self, PyObject* args) {
                                          request_id,
                                          flags,
                                          collection_name,
-                                         collection_name_length);
+                                         collection_name_length,
+                                         0);
     if (length_location == -1) {
         destroy_codec_options(&options);
         PyMem_Free(collection_name);
@@ -669,9 +676,9 @@ _send_insert(PyObject* self, PyObject* ctx,
         }
     }
 
-    /* The max_doc_size parameter for legacy_write is the max size of any
-     * document in buffer. We enforced max size already, pass 0 here. */
-    return PyObject_CallMethod(ctx, "legacy_write",
+    /* The max_doc_size parameter for legacy_bulk_insert is the max size of
+     * any document in buffer. We enforced max size already, pass 0 here. */
+    return PyObject_CallMethod(ctx, "legacy_bulk_insert",
                                "i" BYTES_FORMAT_STRING "iNO",
                                request_id,
                                buffer_get_buffer(buffer),
@@ -689,6 +696,7 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
     int send_safe, flags = 0;
     int length_location, message_length;
     int collection_name_length;
+    int compress;
     char* collection_name = NULL;
     PyObject* docs;
     PyObject* doc;
@@ -698,6 +706,7 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
     PyObject* result;
     PyObject* max_bson_size_obj;
     PyObject* max_message_size_obj;
+    PyObject* compress_obj;
     PyObject* to_publish = NULL;
     unsigned char check_keys;
     unsigned char safe;
@@ -754,6 +763,21 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
         return NULL;
     }
 
+    if (safe) {
+        /* Only unack'ed writes will be compressed */
+        compress = 0;
+    } else {
+        compress_obj = PyObject_GetAttrString(ctx, "compress");
+        compress = PyObject_IsTrue(compress_obj);
+        Py_XDECREF(compress_obj);
+        if (compress == -1) {
+            destroy_codec_options(&options);
+            PyMem_Free(collection_name);
+            return NULL;
+        }
+    }
+
+
     buffer = buffer_new();
     if (!buffer) {
         destroy_codec_options(&options);
@@ -766,7 +790,8 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
                                          request_id,
                                          flags,
                                          collection_name,
-                                         collection_name_length);
+                                         collection_name_length,
+                                         compress);
     if (length_location == -1) {
         goto insertfail;
     }
@@ -797,9 +822,11 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
             /* If we've encoded anything send it before raising. */
             if (!empty) {
                 buffer_update_position(buffer, before);
-                message_length = buffer_get_position(buffer) - length_location;
-                buffer_write_int32_at_position(
-                    buffer, length_location, (int32_t)message_length);
+                if (!compress) {
+                    message_length = buffer_get_position(buffer) - length_location;
+                    buffer_write_int32_at_position(
+                        buffer, length_location, (int32_t)message_length);
+                }
                 result = _send_insert(self, ctx, last_error_args, buffer,
                                       collection_name, collection_name_length,
                                       request_id, send_safe, &options,
@@ -826,7 +853,8 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
                                                new_request_id,
                                                flags,
                                                collection_name,
-                                               collection_name_length);
+                                               collection_name_length,
+                                               compress);
             if (message_start == -1) {
                 buffer_free(new_buffer);
                 goto iterfail;
@@ -927,9 +955,11 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
         goto insertfail;
     }
 
-    message_length = buffer_get_position(buffer) - length_location;
-    buffer_write_int32_at_position(
-        buffer, length_location, (int32_t)message_length);
+    if (!compress) {
+        message_length = buffer_get_position(buffer) - length_location;
+        buffer_write_int32_at_position(
+            buffer, length_location, (int32_t)message_length);
+    }
 
     /* Send the last (or only) batch */
     result = _send_insert(self, ctx, last_error_args, buffer,

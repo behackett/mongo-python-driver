@@ -319,13 +319,9 @@ class _Query(object):
             spec = _maybe_add_read_preference(spec,
                                               self.read_preference)
 
-        if sock_info.compression_context:
-            return query_compressed(
-                flags, ns, self.ntoskip, ntoreturn,
-                spec, None if use_cmd else self.fields,
-                self.codec_options, ctx=sock_info.compression_context)
         return query(flags, ns, self.ntoskip, ntoreturn,
-                     spec, None if use_cmd else self.fields, self.codec_options)
+                     spec, None if use_cmd else self.fields,
+                     self.codec_options, ctx=sock_info.compression_context)
 
 
 class _GetMore(object):
@@ -372,14 +368,9 @@ class _GetMore(object):
             ns = _UJOIN % (self.db, "$cmd")
             spec = self.as_command(sock_info)[0]
 
-            if ctx:
-                return query_compressed(
-                    0, ns, 0, -1, spec, None, self.codec_options, ctx=ctx)
-            return query(0, ns, 0, -1, spec, None, self.codec_options)
+            return query(0, ns, 0, -1, spec, None, self.codec_options, ctx=ctx)
 
-        if ctx:
-            return get_more_compressed(ns, self.ntoreturn, self.cursor_id, ctx)
-        return get_more(ns, self.ntoreturn, self.cursor_id)
+        return get_more(ns, self.ntoreturn, self.cursor_id, ctx)
 
 
 class _RawBatchQuery(_Query):
@@ -497,18 +488,18 @@ def _insert(collection_name, docs, check_keys, flags, opts):
         b"".join(encoded)]), max(map(len, encoded))
 
 
-def insert_compressed(
+def _insert_compressed(
         collection_name, docs, check_keys, continue_on_error, opts, ctx):
-    """Get a compressed unacknowledged insert message."""
+    """Internal compressed unacknowledged insert message helper."""
     op_insert, max_bson_size = _insert(
         collection_name, docs, check_keys, continue_on_error, opts)
     rid, msg = _compress(2002, op_insert, ctx)
     return rid, msg, max_bson_size
 
 
-def insert(collection_name, docs, check_keys,
-           safe, last_error_args, continue_on_error, opts):
-    """Get an **insert** message."""
+def _insert_uncompressed(collection_name, docs, check_keys,
+            safe, last_error_args, continue_on_error, opts):
+    """Internal insert message helper."""
     op_insert, max_bson_size = _insert(
         collection_name, docs, check_keys, continue_on_error, opts)
     rid, msg = __pack_message(2002, op_insert)
@@ -517,7 +508,17 @@ def insert(collection_name, docs, check_keys,
         return rid, msg + gle, max_bson_size
     return rid, msg, max_bson_size
 if _use_c:
-    insert = _cmessage._insert_message
+    _insert_uncompressed = _cmessage._insert_message
+
+
+def insert(collection_name, docs, check_keys,
+           safe, last_error_args, continue_on_error, opts, ctx=None):
+    """Get an **insert** message."""
+    if ctx:
+        return _insert_compressed(
+            collection_name, docs, check_keys, continue_on_error, opts, ctx)
+    return _insert_uncompressed(collection_name, docs, check_keys, safe,
+                                last_error_args, continue_on_error, opts)
 
 
 def _update(collection_name, upsert, multi, spec, doc, check_keys, opts):
@@ -537,19 +538,18 @@ def _update(collection_name, upsert, multi, spec, doc, check_keys, opts):
         encoded_update]), len(encoded_update)
 
 
-def update_compressed(
+def _update_compressed(
         collection_name, upsert, multi, spec, doc, check_keys, opts, ctx):
-    """Get a compressed unacknowledged update message."""
+    """Internal compressed unacknowledged update message helper."""
     op_update, max_bson_size = _update(
         collection_name, upsert, multi, spec, doc, check_keys, opts)
     rid, msg = _compress(2001, op_update, ctx)
     return rid, msg, max_bson_size
 
 
-def update(collection_name, upsert, multi,
-           spec, doc, safe, last_error_args, check_keys, opts):
-    """Get an **update** message.
-    """
+def _update_uncompressed(collection_name, upsert, multi, spec,
+                         doc, safe, last_error_args, check_keys, opts):
+    """Internal update message helper."""
     op_update, max_bson_size = _update(
         collection_name, upsert, multi, spec, doc, check_keys, opts)
     rid, msg = __pack_message(2001, op_update)
@@ -558,7 +558,17 @@ def update(collection_name, upsert, multi,
         return rid, msg + gle, max_bson_size
     return rid, msg, max_bson_size
 if _use_c:
-    update = _cmessage._update_message
+    _update_uncompressed = _cmessage._update_message
+
+
+def update(collection_name, upsert, multi, spec,
+           doc, safe, last_error_args, check_keys, opts, ctx=None):
+    """Get an **update** message."""
+    if ctx:
+        return _update_compressed(
+            collection_name, upsert, multi, spec, doc, check_keys, opts, ctx)
+    return _update_uncompressed(collection_name, upsert, multi, spec,
+                                doc, safe, last_error_args, check_keys, opts)
 
 
 def _query(options, collection_name, num_to_skip,
@@ -591,10 +601,10 @@ def _query(options, collection_name, num_to_skip,
         efs]), max_bson_size
 
 
-def query_compressed(options, collection_name, num_to_skip,
-                     num_to_return, query, field_selector,
-                     opts, check_keys=False, ctx=None):
-    """Get a compressed query message."""
+def _query_compressed(options, collection_name, num_to_skip,
+                      num_to_return, query, field_selector,
+                      opts, check_keys=False, ctx=None):
+    """Internal compressed query message helper."""
     op_query, max_bson_size = _query(
         options,
         collection_name,
@@ -608,9 +618,9 @@ def query_compressed(options, collection_name, num_to_skip,
     return rid, msg, max_bson_size
 
 
-def query(options, collection_name, num_to_skip,
+def _query_uncompressed(options, collection_name, num_to_skip,
           num_to_return, query, field_selector, opts, check_keys=False):
-    """Get a **query** message."""
+    """Internal query message helper."""
     op_query, max_bson_size = _query(
         options,
         collection_name,
@@ -623,7 +633,19 @@ def query(options, collection_name, num_to_skip,
     rid, msg = __pack_message(2004, op_query)
     return rid, msg, max_bson_size
 if _use_c:
-    query = _cmessage._query_message
+    _query_uncompressed = _cmessage._query_message
+
+
+def query(options, collection_name, num_to_skip, num_to_return,
+          query, field_selector, opts, check_keys=False, ctx=None):
+    """Get a **query** message."""
+    if ctx:
+        return _query_compressed(options, collection_name, num_to_skip,
+                                 num_to_return, query, field_selector,
+                                 opts, check_keys, ctx)
+    return _query_uncompressed(options, collection_name, num_to_skip,
+                               num_to_return, query, field_selector, opts,
+                               check_keys)
 
 
 _pack_long_long = struct.Struct("<q").pack
@@ -638,18 +660,26 @@ def _get_more(collection_name, num_to_return, cursor_id):
         _pack_long_long(cursor_id)])
 
 
-def get_more_compressed(collection_name, num_to_return, cursor_id, ctx):
-    """Get a compressed getMore message."""
+def _get_more_compressed(collection_name, num_to_return, cursor_id, ctx):
+    """Internal compressed getMore message helper."""
     return _compress(
         2005, _get_more(collection_name, num_to_return, cursor_id), ctx)
 
 
-def get_more(collection_name, num_to_return, cursor_id):
-    """Get a **getMore** message."""
+def _get_more_uncompressed(collection_name, num_to_return, cursor_id):
+    """Internal getMore message helper."""
     return __pack_message(
         2005, _get_more(collection_name, num_to_return, cursor_id))
 if _use_c:
-    get_more = _cmessage._get_more_message
+    _get_more_uncompressed = _cmessage._get_more_message
+
+
+def get_more(collection_name, num_to_return, cursor_id, ctx=None):
+    """Get a **getMore** message."""
+    if ctx:
+        return _get_more_compressed(
+            collection_name, num_to_return, cursor_id, ctx)
+    return _get_more_uncompressed(collection_name, num_to_return, cursor_id)
 
 
 def _delete(collection_name, spec, opts, flags):
@@ -662,14 +692,26 @@ def _delete(collection_name, spec, opts, flags):
         encoded]), len(encoded)
 
 
-def delete_compressed(collection_name, spec, opts, flags, ctx):
-    """Get a compressed unacknowledged delete message."""
+def _delete_compressed(collection_name, spec, opts, flags, ctx):
+    """Internal compressed unacknowledged delete message helper."""
     op_delete, max_bson_size = _delete(collection_name, spec, opts, flags)
     rid, msg = _compress(2006, op_delete, ctx)
     return rid, msg, max_bson_size
 
 
-def delete(collection_name, spec, safe, last_error_args, opts, flags=0):
+def _delete_uncompressed(
+        collection_name, spec, safe, last_error_args, opts, flags=0):
+    """Internal delete message helper."""
+    op_delete, max_bson_size = _delete(collection_name, spec, opts, flags)
+    rid, msg = __pack_message(2006, op_delete)
+    if safe:
+        rid, gle, _ = __last_error(collection_name, last_error_args)
+        return rid, msg + gle, max_bson_size
+    return rid, msg, max_bson_size
+
+
+def delete(
+        collection_name, spec, safe, last_error_args, opts, flags=0, ctx=None):
     """Get a **delete** message.
 
     `opts` is a CodecOptions. `flags` is a bit vector that may contain
@@ -677,12 +719,10 @@ def delete(collection_name, spec, safe, last_error_args, opts, flags=0):
 
     http://docs.mongodb.org/meta-driver/latest/legacy/mongodb-wire-protocol/#op-delete
     """
-    op_delete, max_bson_size = _delete(collection_name, spec, opts, flags)
-    rid, msg = __pack_message(2006, op_delete)
-    if safe:
-        rid, gle, _ = __last_error(collection_name, last_error_args)
-        return rid, msg + gle, max_bson_size
-    return rid, msg, max_bson_size
+    if ctx:
+        return _delete_compressed(collection_name, spec, opts, flags, ctx)
+    return _delete_uncompressed(
+        collection_name, spec, safe, last_error_args, opts, flags)
 
 
 def kill_cursors(cursor_ids):
@@ -720,7 +760,7 @@ class _BulkWriteContext(object):
         self.field = _FIELD_MAP[self.name]
         self.start_time = datetime.datetime.now() if self.publish else None
         self.session = session
-        self.compress = 1 if sock_info.compression_context else 0
+        self.compress = True if sock_info.compression_context else False
 
     @property
     def max_bson_size(self):
@@ -738,8 +778,8 @@ class _BulkWriteContext(object):
         return self.sock_info.max_write_batch_size
 
     def legacy_bulk_insert(
-            self, request_id, msg, max_doc_size, acknowledged, docs):
-        if self.compress:
+            self, request_id, msg, max_doc_size, acknowledged, docs, compress):
+        if compress:
             request_id, msg = _compress(
                 2002, msg, self.sock_info.compression_context)
         return self.legacy_write(
@@ -858,8 +898,10 @@ def _do_batched_insert(collection_name, docs, check_keys,
     message_length = begin_loc = data.tell()
     has_docs = False
     to_send = []
+    encode = _dict_to_bson  # Make local
+    compress = ctx.compress and not (safe or send_safe)
     for doc in docs:
-        encoded = bson.BSON.encode(doc, check_keys, opts)
+        encoded = encode(doc, check_keys, opts)
         encoded_length = len(encoded)
         too_large = (encoded_length > ctx.max_bson_size)
 
@@ -873,11 +915,12 @@ def _do_batched_insert(collection_name, docs, check_keys,
         if has_docs:
             # We have enough data, send this message.
             try:
-                if ctx.compress and not safe:
+                if compress:
                     rid, msg = None, data.getvalue()
                 else:
                     rid, msg = _insert_message(data.getvalue(), send_safe)
-                ctx.legacy_bulk_insert(rid, msg, 0, send_safe, to_send)
+                ctx.legacy_bulk_insert(
+                    rid, msg, 0, send_safe, to_send, compress)
             # Exception type could be OperationFailure or a subtype
             # (e.g. DuplicateKeyError)
             except OperationFailure as exc:
@@ -905,11 +948,11 @@ def _do_batched_insert(collection_name, docs, check_keys,
     if not has_docs:
         raise InvalidOperation("cannot do an empty bulk insert")
 
-    if ctx.compress and not safe:
+    if compress:
         request_id, msg = None, data.getvalue()
     else:
         request_id, msg = _insert_message(data.getvalue(), safe)
-    ctx.legacy_bulk_insert(request_id, msg, 0, safe, to_send)
+    ctx.legacy_bulk_insert(request_id, msg, 0, safe, to_send, compress)
 
     # Re-raise any exception stored due to continue_on_error
     if last_error is not None:

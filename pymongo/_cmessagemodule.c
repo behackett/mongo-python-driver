@@ -667,7 +667,7 @@ static PyObject*
 _send_insert(PyObject* self, PyObject* ctx,
              PyObject* gle_args, buffer_t buffer,
              char* coll_name, int coll_len, int request_id, int safe,
-             codec_options_t* options, PyObject* to_publish) {
+             codec_options_t* options, PyObject* to_publish, int compress) {
 
     if (safe) {
         if (!add_last_error(self, buffer, request_id,
@@ -679,13 +679,13 @@ _send_insert(PyObject* self, PyObject* ctx,
     /* The max_doc_size parameter for legacy_bulk_insert is the max size of
      * any document in buffer. We enforced max size already, pass 0 here. */
     return PyObject_CallMethod(ctx, "legacy_bulk_insert",
-                               "i" BYTES_FORMAT_STRING "iNO",
+                               "i" BYTES_FORMAT_STRING "iNOi",
                                request_id,
                                buffer_get_buffer(buffer),
                                buffer_get_position(buffer),
                                0,
                                PyBool_FromLong((long)safe),
-                               to_publish);
+                               to_publish, compress);
 }
 
 static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
@@ -763,20 +763,16 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
         return NULL;
     }
 
-    if (safe) {
-        /* Only unack'ed writes will be compressed */
-        compress = 0;
-    } else {
-        compress_obj = PyObject_GetAttrString(ctx, "compress");
-        compress = PyObject_IsTrue(compress_obj);
-        Py_XDECREF(compress_obj);
-        if (compress == -1) {
-            destroy_codec_options(&options);
-            PyMem_Free(collection_name);
-            return NULL;
-        }
+    compress_obj = PyObject_GetAttrString(ctx, "compress");
+    compress = PyObject_IsTrue(compress_obj);
+    Py_XDECREF(compress_obj);
+    if (compress == -1) {
+        destroy_codec_options(&options);
+        PyMem_Free(collection_name);
+        return NULL;
     }
 
+    compress = compress && !(safe || send_safe);
 
     buffer = buffer_new();
     if (!buffer) {
@@ -830,7 +826,7 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
                 result = _send_insert(self, ctx, last_error_args, buffer,
                                       collection_name, collection_name_length,
                                       request_id, send_safe, &options,
-                                      to_publish);
+                                      to_publish, compress);
                 if (!result)
                     goto iterfail;
                 Py_DECREF(result);
@@ -869,13 +865,16 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
 
             /* Roll back to the beginning of this document. */
             buffer_update_position(buffer, before);
-            message_length = buffer_get_position(buffer) - length_location;
-            buffer_write_int32_at_position(
-                buffer, length_location, (int32_t)message_length);
+            if (!compress) {
+                message_length = buffer_get_position(buffer) - length_location;
+                buffer_write_int32_at_position(
+                    buffer, length_location, (int32_t)message_length);
+            }
 
             result = _send_insert(self, ctx, last_error_args, buffer,
                                   collection_name, collection_name_length,
-                                  request_id, send_safe, &options, to_publish);
+                                  request_id, send_safe, &options, to_publish,
+                                  compress);
 
             buffer_free(buffer);
             buffer = new_buffer;
@@ -964,7 +963,7 @@ static PyObject* _cbson_do_batched_insert(PyObject* self, PyObject* args) {
     /* Send the last (or only) batch */
     result = _send_insert(self, ctx, last_error_args, buffer,
                           collection_name, collection_name_length,
-                          request_id, safe, &options, to_publish);
+                          request_id, safe, &options, to_publish, compress);
 
     Py_DECREF(to_publish);
     PyMem_Free(collection_name);
@@ -1018,7 +1017,6 @@ _batched_write_command(
     int idx = 0;
     int cmd_len_loc;
     int lst_len_loc;
-    int request_id;
     int position;
     int length;
     PyObject* max_bson_size_obj;

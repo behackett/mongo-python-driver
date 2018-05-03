@@ -101,7 +101,7 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
         start = datetime.datetime.now()
 
     if name.lower() not in _SENSITIVE_COMMANDS and compression_ctx:
-        request_id, msg, size = message.query_compressed(
+        request_id, msg, size = message.query(
             flags, ns, 0, -1, spec, None, codec_options, check_keys, compression_ctx)
     else:
         request_id, msg, size = message.query(

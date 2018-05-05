@@ -35,6 +35,7 @@ from bson.tz_util import utc
 from pymongo import auth, message
 from pymongo.common import _UUID_REPRESENTATIONS
 from pymongo.command_cursor import CommandCursor
+from pymongo.compression_support import _HAVE_SNAPPY
 from pymongo.cursor import CursorType
 from pymongo.database import Database
 from pymongo.errors import (AutoReconnect,
@@ -62,7 +63,8 @@ from test import (client_context,
                   db_pwd,
                   db_user,
                   MockClientTest,
-                  HAVE_IPADDRESS)
+                  HAVE_IPADDRESS,
+                  COMPRESSORS)
 from test.pymongo_mocks import MockClient
 from test.utils import (assertRaisesExactly,
                         connected,
@@ -1178,6 +1180,71 @@ class TestClient(IntegrationTest):
             MongoClient(uri)
 
         self.assertIn('heartbeatFrequencyMS', str(context.exception))
+
+    def test_compression(self):
+        uri = "mongodb://localhost:27017/?compressors=zlib"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, ['zlib'])
+        uri = "mongodb://localhost:27017/?compressors=zlib&zlibCompressionLevel=4"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, ['zlib'])
+        self.assertEqual(opts.zlib_compression_level, 4)
+        uri = "mongodb://localhost:27017/?compressors=zlib&zlibCompressionLevel=-1"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, ['zlib'])
+        self.assertEqual(opts.zlib_compression_level, -1)
+        uri = "mongodb://localhost:27017"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, [])
+        self.assertEqual(opts.zlib_compression_level, -1)
+        uri = "mongodb://localhost:27017/?compressors=foobar"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, [])
+        self.assertEqual(opts.zlib_compression_level, -1)
+        uri = "mongodb://localhost:27017/?compressors=foobar,zlib"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, ['zlib'])
+        self.assertEqual(opts.zlib_compression_level, -1)
+
+        # According to the connection string spec, unsupported values
+        # just raise a warning and are ignored.
+        uri = "mongodb://localhost:27017/?compressors=zlib&zlibCompressionLevel=10"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, ['zlib'])
+        self.assertEqual(opts.zlib_compression_level, -1)
+        uri = "mongodb://localhost:27017/?compressors=zlib&zlibCompressionLevel=-2"
+        client = MongoClient(uri, connect=False)
+        opts = client._MongoClient__options.pool_options.compression_settings
+        self.assertEqual(opts.compressors, ['zlib'])
+        self.assertEqual(opts.zlib_compression_level, -1)
+
+        if not _HAVE_SNAPPY:
+            uri = "mongodb://localhost:27017/?compressors=snappy"
+            client = MongoClient(uri, connect=False)
+            opts = client._MongoClient__options.pool_options.compression_settings
+            self.assertEqual(opts.compressors, [])
+        else:
+            uri = "mongodb://localhost:27017/?compressors=snappy"
+            client = MongoClient(uri, connect=False)
+            opts = client._MongoClient__options.pool_options.compression_settings
+            self.assertEqual(opts.compressors, ['snappy'])
+            uri = "mongodb://localhost:27017/?compressors=snappy,zlib"
+            client = MongoClient(uri, connect=False)
+            opts = client._MongoClient__options.pool_options.compression_settings
+            self.assertEqual(opts.compressors, ['snappy', 'zlib'])
+
+        if COMPRESSORS and "zlib" in COMPRESSORS:
+            for level in range(1, 10):
+                client = single_client(zlibcompressionlevel=level)
+                # No error
+                client.pymongo_test.test.find_one()
 
 
 class TestExhaustCursor(IntegrationTest):

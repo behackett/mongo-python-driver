@@ -48,7 +48,7 @@ def validate_compressors(dummy, value):
     for compressor in compressors[:]:
         if compressor not in _SUPPORTED_COMPRESSORS:
             compressors.remove(compressor)
-            warnings.warn("Unknown compressor %s", (compressor,))
+            warnings.warn("Unknown compressor %s" % (compressor,))
         elif compressor == "snappy" and not _HAVE_SNAPPY:
             raise ValueError(
                 "You must install the python-snappy module for snappy support.")
@@ -64,7 +64,8 @@ def validate_zlib_compression_level(option, value):
         raise TypeError("%s must be an integer, not %r." % (option, value))
     if level < -1 or level > 9:
         raise ValueError(
-            "%s must be between -1 and 9, not %d." % (option, value))
+            "%s must be between -1 and 9, not %d." % (option, level))
+    return level
 
 
 def decompress(data, compressor_id):

@@ -566,7 +566,8 @@ class SocketInfo(object):
                            self.max_bson_size, read_concern,
                            parse_write_concern_error=parse_write_concern_error,
                            collation=collation,
-                           compression_ctx=self.compression_context)
+                           compression_ctx=self.compression_context,
+                           max_wire_version=self.max_wire_version)
         except OperationFailure:
             raise
         # Catch socket.error, KeyboardInterrupt, etc. and close ourselves.

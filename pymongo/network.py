@@ -37,13 +37,13 @@ except ImportError:
 from bson.py3compat import PY3
 
 from pymongo import helpers, message
-from pymongo.common import MAX_MESSAGE_SIZE
+from pymongo.common import MAX_MESSAGE_SIZE, MAX_WIRE_VERSION
 from pymongo.compression_support import decompress, _NO_COMPRESSION
 from pymongo.errors import (AutoReconnect,
                             NotMasterError,
                             OperationFailure,
                             ProtocolError)
-from pymongo.message import _OpReply
+from pymongo.message import _OpMSG, _OpReply
 
 
 _UNPACK_HEADER = struct.Struct("<iiii").unpack
@@ -56,7 +56,8 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
             read_concern=None,
             parse_write_concern_error=False,
             collation=None,
-            compression_ctx=None):
+            compression_ctx=None,
+            max_wire_version=MAX_WIRE_VERSION):
     """Execute a command over the socket, or raise socket.error.
 
     :Parameters:
@@ -86,8 +87,17 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
 
     # Publish the original command document, perhaps with lsid and $clusterTime.
     orig = spec
+    rpref = None
+    compress_ctx = None
     if is_mongos:
-        spec = message._maybe_add_read_preference(spec, read_preference)
+        if max_wire_version <= 5:
+            spec = message._maybe_add_read_preference(spec, read_preference)
+        else:
+            rpref = read_preference.document if read_preference.mode else None
+
+    if name.lower() not in _NO_COMPRESSION and compression_ctx:
+        compress_ctx = compression_ctx
+
     if read_concern:
         if read_concern.level:
             spec['readConcern'] = read_concern.document
@@ -96,6 +106,7 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
                 and not session._in_transaction):
             spec.setdefault(
                 'readConcern', {})['afterClusterTime'] = session.operation_time
+
     if collation is not None:
         spec['collation'] = collation
 
@@ -103,12 +114,12 @@ def command(sock, dbname, spec, slave_ok, is_mongos,
     if publish:
         start = datetime.datetime.now()
 
-    if name.lower() not in _NO_COMPRESSION and compression_ctx:
-        request_id, msg, size = message.query(
-            flags, ns, 0, -1, spec, None, codec_options, check_keys, compression_ctx)
+    if max_wire_version > 5:
+        request_id, msg, size = message._op_msg_type_zero(
+            spec, dbname, codec_options, check_keys, rpref, compress_ctx)
     else:
         request_id, msg, size = message.query(
-            flags, ns, 0, -1, spec, None, codec_options, check_keys)
+            flags, ns, 0, -1, spec, None, codec_options, check_keys, compress_ctx)
 
     if (max_bson_size is not None
             and size > max_bson_size + message._COMMAND_OVERHEAD):
@@ -173,11 +184,12 @@ def receive_message(sock, request_id, max_message_size=MAX_MESSAGE_SIZE):
             _receive_data_on_socket(sock, length - 25), compressor_id)
     else:
         data = _receive_data_on_socket(sock, length - 16)
-    if op_code != _OpReply.OP_CODE:
-        raise ProtocolError("Got opcode %r but expected "
-                            "%r" % (op_code, _OpReply.OP_CODE))
-
-    return _OpReply.unpack(data)
+    if op_code == _OpReply.OP_CODE:
+        return _OpReply.unpack(data)
+    elif op_code == _OpMSG.OP_CODE:
+        return _OpMSG.unpack(data)
+    else:
+        raise ProtocolError("Got unknown opcode %r" % (op_code,))
 
 
 # memoryview was introduced in Python 2.7 but we only use it on Python 3

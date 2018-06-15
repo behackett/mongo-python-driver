@@ -25,7 +25,7 @@ import random
 import struct
 
 import bson
-from bson import CodecOptions, _make_c_string, _dict_to_bson
+from bson import CodecOptions, _make_c_string, _dict_to_bson, _bson_to_dict
 from bson.codec_options import DEFAULT_CODEC_OPTIONS
 from bson.py3compat import b, StringIO
 from bson.son import SON
@@ -454,6 +454,22 @@ def _compress(operation, data, ctx):
         len(data), # uncompressed message length
         ctx.compressor_id) # compressor id
     return request_id, header + compressed
+
+_op_msg_header = struct.Struct("<iiiiIB").pack
+
+def _op_msg_type_zero(
+        cmd, dbname, codec_options, check_keys, read_preference, ctx):
+    cmd["$db"] = dbname
+    if read_preference:
+        cmd["$readPreference"] = read_preference
+    encoded = _dict_to_bson(cmd, check_keys, codec_options)
+    bson_size = len(encoded)
+    if not ctx:
+        length = 21 + bson_size
+        rid = _randint()
+        return rid, _op_msg_header(length, rid, 0, 2013, 0, 0) + encoded, bson_size
+    rid, msg = _compress(2013, b"\x00\x00" + encoded, ctx)
+    return rid, msg, bson_size
 
 
 def __last_error(namespace, args):
@@ -1095,6 +1111,32 @@ def _batched_write_command(
     buf.write(struct.pack('<i', length - command_start))
 
     return to_send, length
+
+
+class _OpMSG(object):
+    __slots__ = ("flags", "document")
+
+    UNPACK_FROM = struct.Struct('<IB').unpack_from
+    OP_CODE = 2013
+
+    def __init__(self, flags, document):
+        self.flags = flags
+        self.document = document
+
+    def unpack_response(self, codec_options=_UNICODE_REPLACE_CODEC_OPTIONS):
+        return [_bson_to_dict(self.document, codec_options)]
+
+    @classmethod
+    def unpack(cls, msg):
+        """Construct an _OpMSG from raw bytes."""
+        flags, payload_type = cls.UNPACK_FROM(msg, 0)
+        assert payload_type == 0, "Type 1 payload returns are not supported"
+
+        document = msg[5:]
+        if not isinstance(msg, bytes):
+            # msg is a memoryview in Python 3.
+            document = document.tobytes()
+        return cls(flags, document)
 
 
 class _OpReply(object):
